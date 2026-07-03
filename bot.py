@@ -1,5 +1,6 @@
 import logging
 import os
+import sqlite3
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -25,6 +26,62 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Store saved items in a local SQLite database file in this project folder.
+DATABASE_NAME = "brainbot.db"
+
+
+def create_items_table() -> None:
+    """Create the SQLite table once when the bot starts."""
+    # sqlite3.connect creates the database file automatically if it does not
+    # already exist.
+    with sqlite3.connect(DATABASE_NAME) as connection:
+        # The items table stores one row for each thing the user sends.
+        # created_at uses SQLite's CURRENT_TIMESTAMP so Python does not need to
+        # calculate the time manually.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+
+def save_item(item_type: str, content: str) -> None:
+    """Insert one detected message item into the SQLite database."""
+    with sqlite3.connect(DATABASE_NAME) as connection:
+        # The question marks are SQL parameters. They safely pass values into
+        # the query without building SQL by string concatenation.
+        connection.execute(
+            "INSERT INTO items (type, content) VALUES (?, ?)",
+            (item_type, content),
+        )
+
+
+def detect_message_item(message) -> tuple[str, str]:
+    """Detect whether a Telegram message is a photo, link, or plain text."""
+    # Check for photos first. Telegram sends multiple sizes of the same photo,
+    # and the largest size is the last item in message.photo.
+    if message.photo:
+        largest_photo = message.photo[-1]
+        return "photo", largest_photo.file_id
+
+    # For text messages, keep the complete message text as the saved content.
+    # If Telegram sends a non-text message that is not a photo, this becomes an
+    # empty note instead of crashing.
+    text = message.text or ""
+
+    # After photos, detect links by looking for either common URL prefix.
+    if "http://" in text or "https://" in text:
+        return "link", text
+
+    # Anything else is treated as a plain note.
+    return "text", text
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reply when a user sends the /start command."""
     await update.message.reply_text(
@@ -34,7 +91,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply to any non-command message the bot receives."""
+    """Detect, save, and reply to any non-command message the bot receives."""
     user = update.effective_user
     message = update.effective_message
 
@@ -48,8 +105,17 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user.id if user else "unknown",
     )
 
-    # Reply to the message, whether it was text, a photo, a document, etc.
-    await message.reply_text("Got it 👍")
+    # Figure out what kind of content the user sent, then save it locally.
+    item_type, content = detect_message_item(message)
+    save_item(item_type, content)
+
+    # Send a friendly confirmation that matches the detected item type.
+    replies = {
+        "link": "Saved a link \U0001f517",
+        "photo": "Saved a screenshot \U0001f4f8",
+        "text": "Saved a note \U0001f4dd",
+    }
+    await message.reply_text(replies[item_type])
 
 
 def main() -> None:
@@ -59,6 +125,9 @@ def main() -> None:
     # Stop early with a helpful error if BOT_TOKEN is missing.
     if not bot_token:
         raise RuntimeError("BOT_TOKEN is missing. Add it to your .env file.")
+
+    # Make sure the database table exists before Telegram updates arrive.
+    create_items_table()
 
     # Build the async python-telegram-bot application.
     application = Application.builder().token(bot_token).build()
