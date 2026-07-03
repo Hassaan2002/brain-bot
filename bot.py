@@ -26,15 +26,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Store saved items in a local SQLite database file in this project folder.
-DATABASE_NAME = "brainbot.db"
+# Store saved items in a SQLite database file. DB_PATH can point to a custom
+# file, while the default keeps local testing simple.
+DB_PATH = os.getenv("DB_PATH", "brainbot.db")
 
 
 def create_items_table() -> None:
     """Create the SQLite table once when the bot starts."""
     # sqlite3.connect creates the database file automatically if it does not
     # already exist.
-    with sqlite3.connect(DATABASE_NAME) as connection:
+    with sqlite3.connect(DB_PATH) as connection:
         # The items table stores one row for each thing the user sends.
         # created_at uses SQLite's CURRENT_TIMESTAMP so Python does not need to
         # calculate the time manually.
@@ -52,7 +53,7 @@ def create_items_table() -> None:
 
 def save_item(item_type: str, content: str) -> None:
     """Insert one detected message item into the SQLite database."""
-    with sqlite3.connect(DATABASE_NAME) as connection:
+    with sqlite3.connect(DB_PATH) as connection:
         # The question marks are SQL parameters. They safely pass values into
         # the query without building SQL by string concatenation.
         connection.execute(
@@ -63,7 +64,7 @@ def save_item(item_type: str, content: str) -> None:
 
 def get_all_items() -> list[tuple[int, str, str, str]]:
     """Read all saved items from the SQLite database."""
-    with sqlite3.connect(DATABASE_NAME) as connection:
+    with sqlite3.connect(DB_PATH) as connection:
         # Return the oldest items first so the debug output reads like history.
         return connection.execute(
             """
