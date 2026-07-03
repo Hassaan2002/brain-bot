@@ -61,6 +61,27 @@ def save_item(item_type: str, content: str) -> None:
         )
 
 
+def get_all_items() -> list[tuple[int, str, str, str]]:
+    """Read all saved items from the SQLite database."""
+    with sqlite3.connect(DATABASE_NAME) as connection:
+        # Return the oldest items first so the debug output reads like history.
+        return connection.execute(
+            """
+            SELECT id, type, content, created_at
+            FROM items
+            ORDER BY id
+            """
+        ).fetchall()
+
+
+def truncate_content(content: str, max_length: int = 50) -> str:
+    """Shorten long content so the debug message stays readable."""
+    if len(content) <= max_length:
+        return content
+
+    return content[:max_length] + "..."
+
+
 def detect_message_item(message) -> tuple[str, str]:
     """Detect whether a Telegram message is a photo, link, or plain text."""
     # Check for photos first. Telegram sends multiple sizes of the same photo,
@@ -88,6 +109,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Welcome! Send me any content and I will save it for you. "
         "Later, I will help summarize what you share."
     )
+
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with a readable list of all saved database rows."""
+    items = get_all_items()
+
+    # Give a clear response when the database table exists but has no rows yet.
+    if not items:
+        await update.message.reply_text("No saved items yet.")
+        return
+
+    # Build one readable block per row. Content is truncated to avoid very long
+    # Telegram messages when a note or URL is large.
+    lines = ["Saved items:"]
+    for item_id, item_type, content, created_at in items:
+        short_content = truncate_content(content)
+        lines.append(
+            f"{item_id}. type: {item_type}\n"
+            f"   content: {short_content}\n"
+            f"   created_at: {created_at}"
+        )
+
+    await update.message.reply_text("\n\n".join(lines))
 
 
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -134,6 +178,9 @@ def main() -> None:
 
     # /start has its own welcome response.
     application.add_handler(CommandHandler("start", start))
+
+    # /debug shows all saved rows from the SQLite database.
+    application.add_handler(CommandHandler("debug", debug))
 
     # This catches every non-command message, including text, photos,
     # documents, stickers, voice messages, and more.
