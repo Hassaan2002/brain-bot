@@ -1,6 +1,12 @@
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
 import os
+import re
 import sqlite3
+from io import BytesIO
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -30,6 +36,20 @@ logger = logging.getLogger(__name__)
 # file, while the default keeps local testing simple.
 DB_PATH = os.getenv("DB_PATH", "brainbot.db")
 
+# Keep Claude input bounded so one very large article does not create a costly
+# or over-limit API request.
+MAX_CLAUDE_INPUT_CHARS = 8000
+
+# Claude must choose exactly one of these categories for weekly summaries.
+CATEGORIES = [
+    "AI/Tech",
+    "Career",
+    "Money/Finance",
+    "Learning",
+    "Ideas/Inspiration",
+    "Personal",
+]
+
 
 def create_items_table() -> None:
     """Create the SQLite table once when the bot starts."""
@@ -45,15 +65,40 @@ def create_items_table() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 type TEXT,
                 content TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                summary TEXT,
+                category TEXT
             )
             """
         )
+        add_missing_item_columns(connection)
+
+
+def add_missing_item_columns(connection: sqlite3.Connection) -> None:
+    """Add newer nullable columns when an older database is reused."""
+    # PRAGMA table_info tells us the current columns. SQLite can add columns,
+    # but this compatibility check avoids trying to add the same column twice.
+    existing_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(items)").fetchall()
+    }
+
+    if "summary" not in existing_columns:
+        connection.execute("ALTER TABLE items ADD COLUMN summary TEXT")
+
+    if "category" not in existing_columns:
+        connection.execute("ALTER TABLE items ADD COLUMN category TEXT")
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """Open a database connection that returns rows by column name."""
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def save_item(item_type: str, content: str) -> None:
     """Insert one detected message item into the SQLite database."""
-    with sqlite3.connect(DB_PATH) as connection:
+    with get_db_connection() as connection:
         # The question marks are SQL parameters. They safely pass values into
         # the query without building SQL by string concatenation.
         connection.execute(
@@ -62,9 +107,9 @@ def save_item(item_type: str, content: str) -> None:
         )
 
 
-def get_all_items() -> list[tuple[int, str, str, str]]:
+def get_all_items() -> list[sqlite3.Row]:
     """Read all saved items from the SQLite database."""
-    with sqlite3.connect(DB_PATH) as connection:
+    with get_db_connection() as connection:
         # Return the oldest items first so the debug output reads like history.
         return connection.execute(
             """
@@ -75,12 +120,178 @@ def get_all_items() -> list[tuple[int, str, str, str]]:
         ).fetchall()
 
 
+def get_items_from_last_week() -> list[sqlite3.Row]:
+    """Read saved items whose SQLite timestamp is within the last 7 days."""
+    with get_db_connection() as connection:
+        return connection.execute(
+            """
+            SELECT id, type, content, created_at, summary, category
+            FROM items
+            WHERE created_at >= datetime('now', '-7 days')
+            ORDER BY id
+            """
+        ).fetchall()
+
+
+def get_item_by_id(item_id: int) -> sqlite3.Row | None:
+    """Find one saved item by id."""
+    with get_db_connection() as connection:
+        return connection.execute(
+            """
+            SELECT id, type, content, created_at, summary, category
+            FROM items
+            WHERE id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+
+
+def update_item_summary(item_id: int, summary: str, category: str) -> None:
+    """Store the cached short summary and category for an item."""
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            UPDATE items
+            SET summary = ?, category = ?
+            WHERE id = ?
+            """,
+            (summary, category, item_id),
+        )
+
+
 def truncate_content(content: str, max_length: int = 50) -> str:
     """Shorten long content so the debug message stays readable."""
     if len(content) <= max_length:
         return content
 
     return content[:max_length] + "..."
+
+
+def extract_first_url(text: str) -> str | None:
+    """Find the first http:// or https:// URL inside saved message text."""
+    match = re.search(r"https?://\S+", text)
+    if not match:
+        return None
+
+    return match.group(0).rstrip(".,)")
+
+
+def source_reference(item: sqlite3.Row) -> str:
+    """Create a compact source label for summaries."""
+    if item["type"] == "link":
+        return extract_first_url(item["content"]) or item["content"]
+
+    if item["type"] == "photo":
+        return "[screenshot]"
+
+    return "[note]"
+
+
+async def extract_content(
+    item: sqlite3.Row, context: ContextTypes.DEFAULT_TYPE | None = None
+) -> str | None:
+    """Return raw text that Claude can summarize for one saved item."""
+    if item["type"] == "text":
+        return item["content"]
+
+    if item["type"] == "link":
+        # trafilatura fetches and extracts the main readable article text,
+        # which is usually cleaner than sending menus, ads, and sidebars.
+        import trafilatura
+
+        url = extract_first_url(item["content"])
+        if not url:
+            return None
+
+        downloaded = await asyncio.to_thread(trafilatura.fetch_url, url)
+        if not downloaded:
+            return None
+
+        extracted = await asyncio.to_thread(trafilatura.extract, downloaded)
+        return extracted.strip() if extracted else None
+
+    if item["type"] == "photo":
+        # Photos are stored as Telegram file_ids, so we ask Telegram for the
+        # actual file bytes before OCR can read text from the image.
+        if context is None:
+            return None
+
+        from PIL import Image
+        import pytesseract
+
+        telegram_file = await context.bot.get_file(item["content"])
+        image_bytes = await telegram_file.download_as_bytearray()
+
+        with Image.open(BytesIO(image_bytes)) as image:
+            extracted = await asyncio.to_thread(pytesseract.image_to_string, image)
+
+        return extracted.strip() if extracted else None
+
+    return None
+
+
+def parse_claude_json(text: str) -> dict:
+    """Parse Claude JSON, including responses wrapped in markdown fences."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        cleaned = cleaned.removeprefix("json").strip()
+
+    return json.loads(cleaned)
+
+
+def call_claude(text: str, mode: str) -> dict:
+    """Ask Claude for either a cached short summary or a detailed summary."""
+    import anthropic
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is missing from the environment.")
+
+    # Truncate the source text before sending it to control cost and avoid
+    # exceeding model input limits on very long articles or OCR output.
+    safe_text = text[:MAX_CLAUDE_INPUT_CHARS]
+
+    if mode == "short":
+        prompt = (
+            "Summarize the content in 1-2 sentences and choose exactly one "
+            "category from this fixed list: "
+            f"{', '.join(CATEGORIES)}.\n\n"
+            'Return only valid JSON shaped like: {"summary": "...", '
+            '"category": "..."}.\n\n'
+            f"Content:\n{safe_text}"
+        )
+        max_tokens = 500
+    elif mode == "long":
+        prompt = (
+            "Write a thorough summary of roughly 300-500 words covering the "
+            "key points, arguments, and important details. Use plain, clear "
+            'prose.\n\nReturn only valid JSON shaped like: {"summary": "..."}.\n\n'
+            f"Content:\n{safe_text}"
+        )
+        max_tokens = 1400
+    else:
+        raise ValueError(f"Unsupported Claude mode: {mode}")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
+        max_tokens=max_tokens,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # Anthropic returns message content as blocks. We join text blocks before
+    # parsing the JSON the prompt requested.
+    response_text = "".join(
+        block.text for block in response.content if getattr(block, "type", None) == "text"
+    )
+    parsed = parse_claude_json(response_text)
+
+    if mode == "short" and parsed.get("category") not in CATEGORIES:
+        parsed["category"] = "Personal"
+
+    return parsed
 
 
 def detect_message_item(message) -> tuple[str, str]:
@@ -124,15 +335,120 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Build one readable block per row. Content is truncated to avoid very long
     # Telegram messages when a note or URL is large.
     lines = ["Saved items:"]
-    for item_id, item_type, content, created_at in items:
-        short_content = truncate_content(content)
+    for item in items:
+        short_content = truncate_content(item["content"])
         lines.append(
-            f"{item_id}. type: {item_type}\n"
+            f"{item['id']}. type: {item['type']}\n"
             f"   content: {short_content}\n"
-            f"   created_at: {created_at}"
+            f"   created_at: {item['created_at']}"
         )
 
     await update.message.reply_text("\n\n".join(lines))
+
+
+async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Summarize saves from the last week, grouped by Claude category."""
+    items = get_items_from_last_week()
+
+    if not items:
+        await update.message.reply_text("No saves in the last week \U0001f440")
+        return
+
+    processed_items = []
+    for item in items:
+        summary = item["summary"]
+        category = item["category"]
+
+        # Only call extraction and Claude for items that have not already been
+        # processed. This keeps /weekly faster and avoids repeated API cost.
+        if not summary or not category:
+            raw_text = await extract_content(item, context)
+
+            if raw_text is None:
+                summary = "Could not extract content"
+                category = "Personal"
+            else:
+                try:
+                    claude_result = await asyncio.to_thread(
+                        call_claude, raw_text, mode="short"
+                    )
+                except Exception as error:
+                    logger.exception("Claude short summary failed for item %s", item["id"])
+                    await update.message.reply_text(f"Claude summary failed: {error}")
+                    return
+
+                summary = claude_result.get("summary", "").strip()
+                category = claude_result.get("category", "Personal").strip()
+
+                if category not in CATEGORIES:
+                    category = "Personal"
+
+            update_item_summary(item["id"], summary, category)
+
+        processed_items.append(
+            {
+                "id": item["id"],
+                "summary": summary,
+                "category": category,
+                "source": source_reference(item),
+            }
+        )
+
+    lines = ["Weekly saves:"]
+    for category in CATEGORIES:
+        category_items = [
+            item for item in processed_items if item["category"] == category
+        ]
+        if not category_items:
+            continue
+
+        lines.append(f"\n{category}")
+        for item in category_items:
+            lines.append(
+                f"[{item['id']}] {item['summary']}\n"
+                f"Source: {item['source']}"
+            )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with a fresh detailed summary for one saved item."""
+    if not context.args:
+        await update.message.reply_text("Use /details <id>")
+        return
+
+    try:
+        item_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Use /details <id>")
+        return
+
+    item = get_item_by_id(item_id)
+    if item is None:
+        await update.message.reply_text("Couldn't find that item")
+        return
+
+    raw_text = await extract_content(item, context)
+    if raw_text is None:
+        await update.message.reply_text(
+            f"Could not extract content from {source_reference(item)}"
+        )
+        return
+
+    try:
+        claude_result = await asyncio.to_thread(call_claude, raw_text, mode="long")
+    except Exception as error:
+        logger.exception("Claude detailed summary failed for item %s", item["id"])
+        await update.message.reply_text(f"Claude summary failed: {error}")
+        return
+
+    summary = claude_result.get("summary", "").strip()
+    await update.message.reply_text(
+        f"Details for [{item['id']}]\n"
+        f"Source: {source_reference(item)}\n\n"
+        f"{summary}"
+    )
 
 
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -182,6 +498,12 @@ def main() -> None:
 
     # /debug shows all saved rows from the SQLite database.
     application.add_handler(CommandHandler("debug", debug))
+
+    # /weekly summarizes recent saves by category.
+    application.add_handler(CommandHandler("weekly", weekly))
+
+    # /details <id> gives a fresh detailed summary for one saved item.
+    application.add_handler(CommandHandler("details", details))
 
     # This catches every non-command message, including text, photos,
     # documents, stickers, voice messages, and more.

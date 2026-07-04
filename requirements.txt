@@ -1,2 +1,6 @@
 python-telegram-bot>=20,<22
 python-dotenv>=1.0.0
+trafilatura
+pytesseract
+Pillow
+anthropic
