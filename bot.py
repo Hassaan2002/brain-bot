@@ -275,7 +275,7 @@ def call_claude(text: str, mode: str) -> dict:
 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
-        model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
+        model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
         max_tokens=max_tokens,
         temperature=0,
         messages=[{"role": "user", "content": prompt}],
